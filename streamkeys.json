@@ -1,0 +1,18 @@
+{
+  "1234": {
+    "label": "1234",
+    "active": true,
+    "auto": true,
+    "createdAt": "2026-05-06T19:33:25.437Z"
+  },
+  "sk_243b5044": {
+    "label": "TestChannel",
+    "active": true,
+    "createdAt": "2026-05-06T19:09:49.669Z"
+  },
+  "sk_25fc25ff": {
+    "label": "TestChannel",
+    "active": true,
+    "createdAt": "2026-05-06T19:21:53.084Z"
+  }
+}
