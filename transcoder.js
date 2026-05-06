@@ -21,8 +21,8 @@ import { uploadFile, publicUrlFor } from './uploader.js';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const FFMPEG_PATH = process.env.FFMPEG_PATH || 'ffmpeg';
-const TMP_DIR     = path.resolve(__dirname, process.env.TMP_DIR || './tmp/live');
-const RTMP_PORT   = parseInt(process.env.RTMP_PORT || '1935', 10);
+const TMP_DIR = path.resolve(__dirname, process.env.TMP_DIR || './tmp/live');
+const RTMP_PORT = parseInt(process.env.RTMP_PORT || '1935', 10);
 
 /**
  * Adaptive-bitrate ladder.
@@ -30,14 +30,14 @@ const RTMP_PORT   = parseInt(process.env.RTMP_PORT || '1935', 10);
  * with a safety margin).
  */
 const RENDITIONS = [
-  { name: '1080p', width: 1920, height: 1080, vBitrate: '4000k', vMaxRate: '4280k', vBufSize: '6000k', aBitrate: '192k', bandwidth: 4500000 },
-  { name: '720p',  width: 1280, height: 720,  vBitrate: '2500k', vMaxRate: '2675k', vBufSize: '3750k', aBitrate: '128k', bandwidth: 2800000 },
-  { name: '480p',  width: 854,  height: 480,  vBitrate: '1000k', vMaxRate: '1070k', vBufSize: '1500k', aBitrate: '96k',  bandwidth: 1200000 },
+  // { name: '1080p', width: 1920, height: 1080, vBitrate: '4000k', vMaxRate: '4280k', vBufSize: '6000k', aBitrate: '192k', bandwidth: 4500000 },
+  { name: '720p', width: 1280, height: 720, vBitrate: '2500k', vMaxRate: '2675k', vBufSize: '3750k', aBitrate: '128k', bandwidth: 2800000 },
+  { name: '480p', width: 854, height: 480, vBitrate: '1000k', vMaxRate: '1070k', vBufSize: '1500k', aBitrate: '96k', bandwidth: 1200000 },
 ];
 
-const HLS_SEGMENT_DURATION = 4;       // seconds per segment
-const HLS_LIST_SIZE        = 6;       // segments retained in live playlist
-const KEYFRAME_INTERVAL_S  = 2;       // forced GOP length (seconds)
+const HLS_SEGMENT_DURATION = 2;   // faster playlist updates = less freezing
+const HLS_LIST_SIZE = 4;   // less disk/memory on t2.micro    // segments retained in live playlist
+const KEYFRAME_INTERVAL_S = 2;       // forced GOP length (seconds)
 
 // streamKey -> { proc, stopping, exitPromise, handle }
 const processes = new Map();
@@ -56,11 +56,11 @@ export function isTranscoding(streamKey) {
  * one decode pass — cheaper CPU than three independent ffmpegs.
  */
 function buildFfmpegArgs(streamKey) {
-  const inputUrl  = `rtmp://127.0.0.1:${RTMP_PORT}/live/${streamKey}`;
+  const inputUrl = `rtmp://127.0.0.1:${RTMP_PORT}/live/${streamKey}`;
   const streamDir = path.join(TMP_DIR, streamKey);
 
   // %v gets replaced per-rendition by ffmpeg using the `name:` token in var_stream_map.
-  const segmentTemplate  = path.join(streamDir, '%v', 'seg%05d.ts');
+  const segmentTemplate = path.join(streamDir, '%v', 'seg%05d.ts');
   const playlistTemplate = path.join(streamDir, '%v', 'index.m3u8');
 
   // [0:v]split=3[v1][v2][v3]; [vN]scale=w=W:h=H[vNout]
@@ -73,7 +73,11 @@ function buildFfmpegArgs(streamKey) {
   const args = [
     '-hide_banner',
     '-loglevel', 'warning',
-    '-fflags', '+genpts',
+    '-fflags', '+genpts+nobuffer+discardcorrupt',
+    '-flags', 'low_delay',
+    '-probesize', '32768',
+    '-analyzeduration', '0',
+    '-thread_queue_size', '512',
     '-i', inputUrl,
     '-filter_complex', filter,
   ];
@@ -82,15 +86,17 @@ function buildFfmpegArgs(streamKey) {
   RENDITIONS.forEach((r, i) => {
     args.push(
       '-map', `[v${i + 1}out]`,
-      `-c:v:${i}`,        'libx264',
-      `-preset:v:${i}`,   'veryfast',
-      `-profile:v:${i}`,  'main',
-      `-pix_fmt`,         'yuv420p',
-      `-b:v:${i}`,        r.vBitrate,
-      `-maxrate:v:${i}`,  r.vMaxRate,
-      `-bufsize:v:${i}`,  r.vBufSize,
+      `-c:v:${i}`, 'libx264',
+      `-preset:v:${i}`, 'ultrafast',
+      `-tune:v:${i}`, 'zerolatency',   // ← ADD
+      `-profile:v:${i}`, 'baseline',      // ← baseline not main (better compat)
+      `-threads`, '1',             // ← limit per-rendition threads on 1 vCPU
+      `-pix_fmt`, 'yuv420p',
+      `-b:v:${i}`, r.vBitrate,
+      `-maxrate:v:${i}`, r.vMaxRate,
+      `-bufsize:v:${i}`, r.vBufSize,
       `-force_key_frames:v:${i}`, `expr:gte(t,n_forced*${KEYFRAME_INTERVAL_S})`,
-      `-sc_threshold`,    '0',
+      `-sc_threshold`, '0',
     );
   });
 
@@ -98,10 +104,10 @@ function buildFfmpegArgs(streamKey) {
   RENDITIONS.forEach((r, i) => {
     args.push(
       '-map', 'a:0?',
-      `-c:a:${i}`,    'aac',
-      `-b:a:${i}`,    r.aBitrate,
-      `-ac:a:${i}`,   '2',
-      `-ar:a:${i}`,   '48000',
+      `-c:a:${i}`, 'aac',
+      `-b:a:${i}`, r.aBitrate,
+      `-ac:a:${i}`, '2',
+      `-ar:a:${i}`, '48000',
     );
   });
 
@@ -112,13 +118,13 @@ function buildFfmpegArgs(streamKey) {
 
   args.push(
     '-f', 'hls',
-    '-hls_time',             String(HLS_SEGMENT_DURATION),
-    '-hls_list_size',        String(HLS_LIST_SIZE),
-    '-hls_flags',            'delete_segments+independent_segments+program_date_time',
-    '-hls_segment_type',     'mpegts',
+    '-hls_time', String(HLS_SEGMENT_DURATION),
+    '-hls_list_size', String(HLS_LIST_SIZE),
+    '-hls_flags', 'delete_segments+independent_segments+program_date_time',
+    '-hls_segment_type', 'mpegts',
     '-hls_segment_filename', segmentTemplate,
-    '-master_pl_name',       '_ffmpeg_master.m3u8',
-    '-var_stream_map',       varStreamMap,
+    '-master_pl_name', '_ffmpeg_master.m3u8',
+    '-var_stream_map', varStreamMap,
     playlistTemplate,
   );
 
@@ -140,9 +146,9 @@ async function uploadMasterPlaylist(streamKey) {
   }
   const body = lines.join('\n') + '\n';
   await uploadFile({
-    key:          `live/${streamKey}/master.m3u8`,
-    body:         Buffer.from(body, 'utf8'),
-    contentType:  'application/vnd.apple.mpegurl',
+    key: `live/${streamKey}/master.m3u8`,
+    body: Buffer.from(body, 'utf8'),
+    contentType: 'application/vnd.apple.mpegurl',
     cacheControl: 'no-cache, no-store, must-revalidate',
   });
   console.log(`[transcoder] master.m3u8 uploaded for ${streamKey}`);
