@@ -9,7 +9,12 @@
 //        - retry up to 3 times with exponential backoff
 //        - on success: delete local .ts files immediately
 //          (keep .m3u8 playlists so ffmpeg can rewrite them in place)
-//   4. Keep at most ~8 segments per quality in R2 (rotation).
+//   4. EVERY produced segment for EVERY rendition is preserved on R2 for
+//      the lifetime of the broadcast — no live rotation. This guarantees
+//      the post-stream VOD pipeline can rebuild the FULL recording.
+//      All live/<streamKey>/* objects are removed in a single sweep at the
+//      end of vod.js. Local disk usage stays near zero because each .ts
+//      file is deleted as soon as it lands on R2.
 //
 // Public API:
 //   getR2Client()                     -> S3 client (lazily built)
@@ -18,6 +23,9 @@
 //   startWatcher(streamKey)           -> begin watching tmp/live/<streamKey>
 //   stopWatcher(streamKey)            -> close watcher (called when stream ends)
 //   flushPending(streamKey)           -> awaits any in-flight uploads for the stream
+//   sweepStreamDir(streamKey)         -> upload everything still on disk
+//                                        (catches segments chokidar missed
+//                                        because of the close race at stream end)
 //   uploadLocalFile(streamKey, file)  -> manually upload a specific file (used by VOD)
 
 import 'dotenv/config';
@@ -50,13 +58,7 @@ const SECRET_KEY     = process.env.R2_SECRET_ACCESS_KEY;
 const PUBLIC_URL     = (process.env.R2_PUBLIC_URL || '').replace(/\/+$/, '');
 const MAX_PARALLEL   = parseInt(process.env.MAX_UPLOAD_CONCURRENCY || '5', 10);
 
-// Number of newest segments per quality to keep in R2. Anything older is purged.
-const LIVE_ROTATION_KEEP = 8;
-
-// Renditions whose segments are NOT rotated during live — we need them for
-// the post-stream MP4 concat / VOD playlist. Other qualities rotate to
-// minimize R2 storage cost while live.
-const VOD_SOURCE_QUALITIES = new Set(['1080p']);
+// (No live rotation — see header comment.)
 
 // ---------------------------------------------------------------------------
 // S3 / R2 client (lazy singleton)
@@ -85,9 +87,13 @@ const limit = pLimit(MAX_PARALLEL);
 
 // Per-stream bookkeeping. Each entry:
 //   {
-//     watcher,                       // chokidar instance
-//     pending: Set<Promise>,         // in-flight upload promises (so we can flush)
-//     segmentHistory: Map<quality, string[]>  // ordered seg filenames per quality
+//     watcher,                          // chokidar instance
+//     pending:    Set<Promise>,         // in-flight upload promises
+//     uploaded:   Set<string>,          // local paths that have been successfully
+//                                       //   uploaded at least once (used by the
+//                                       //   sweep so we don't double-upload
+//                                       //   playlists that ffmpeg rewrites in place)
+//     inflight:   Set<string>           // local paths currently being uploaded
 //   }
 const streams = new Map();
 
@@ -194,13 +200,24 @@ function localToR2Key(streamKey, localPath) {
  * Upload a single local file to R2. After a successful .ts upload the local
  * file is deleted to keep disk usage minimal. Playlist files are kept locally
  * because ffmpeg keeps overwriting them while the stream is live.
+ *
+ * Idempotent for .ts files — if the same path is requested twice (e.g. by
+ * the chokidar watcher AND the final sweep) the second call short-circuits.
  */
 export async function uploadLocalFile(streamKey, localPath) {
   const state = streams.get(streamKey);
   if (!state) return; // watcher already torn down
 
-  const key = localToR2Key(streamKey, localPath);
   const ext = path.extname(localPath).toLowerCase();
+
+  // Dedup: if the file has already been uploaded once and was a segment, skip.
+  // Playlists may legitimately come back through here many times because
+  // ffmpeg rewrites them on every segment rotation.
+  if (ext === '.ts' && state.uploaded.has(localPath)) return;
+  if (state.inflight.has(localPath)) return;
+
+  state.inflight.add(localPath);
+  const key = localToR2Key(streamKey, localPath);
 
   const job = limit(async () => {
     let body;
@@ -225,46 +242,22 @@ export async function uploadLocalFile(streamKey, localPath) {
     if (ext === '.ts') {
       // Local file is no longer needed — keep disk near zero.
       await deleteFile(localPath);
-      // Track for live rotation in R2.
-      trackSegmentForRotation(streamKey, localPath, key);
+      state.uploaded.add(localPath);
     }
     // For .m3u8 we KEEP the local copy because ffmpeg will rewrite it.
     // For .mp4 (recording) the VOD module manages its own cleanup.
   });
 
   state.pending.add(job);
-  job.finally(() => state.pending.delete(job));
+  job.finally(() => {
+    state.pending.delete(job);
+    state.inflight.delete(localPath);
+  });
 
   try {
     await job;
   } catch (err) {
     console.error(`[uploader] upload pipeline error for ${localPath}: ${err.message}`);
-  }
-}
-
-/**
- * Track a freshly uploaded .ts segment and prune anything beyond the
- * LIVE_ROTATION_KEEP newest segments for that quality.
- */
-function trackSegmentForRotation(streamKey, localPath, r2Key) {
-  const state = streams.get(streamKey);
-  if (!state) return;
-
-  // quality is the immediate parent dir under the stream tmp root.
-  const quality = path.basename(path.dirname(localPath));
-  if (!state.segmentHistory.has(quality)) {
-    state.segmentHistory.set(quality, []);
-  }
-  const list = state.segmentHistory.get(quality);
-  list.push(r2Key);
-
-  // VOD source qualities (e.g. 1080p) are kept on R2 for post-stream
-  // concat/VOD playlist generation. Other qualities rotate aggressively.
-  if (VOD_SOURCE_QUALITIES.has(quality)) return;
-
-  while (list.length > LIVE_ROTATION_KEEP) {
-    const stale = list.shift();
-    deleteR2Object(stale).catch(() => { /* logged inside */ });
   }
 }
 
@@ -284,17 +277,26 @@ export function startWatcher(streamKey) {
   const watcher = chokidar.watch(streamDir, {
     ignoreInitial:    false,
     persistent:       true,
+    // Polling is more reliable across platforms (especially Windows) for
+    // the high event volume produced by 3 renditions × 4-second segments.
+    // The cost is small and well worth the guarantee that no events are
+    // dropped — missed events translated directly to missing VOD seconds.
+    usePolling:       true,
+    interval:         200,
+    binaryInterval:   400,
     awaitWriteFinish: {
-      // Wait for ffmpeg to finish writing the file before we read it.
-      stabilityThreshold: 250,
-      pollInterval:       50,
+      // Short stability window — ffmpeg writes a segment in one quick burst
+      // and then is done. 80ms is plenty without delaying uploads.
+      stabilityThreshold: 80,
+      pollInterval:       40,
     },
   });
 
   const state = {
     watcher,
-    pending:         new Set(),
-    segmentHistory:  new Map(),
+    pending:  new Set(),
+    uploaded: new Set(),
+    inflight: new Set(),
   };
   streams.set(streamKey, state);
 
@@ -322,6 +324,58 @@ export async function flushPending(streamKey) {
   while (state.pending.size > 0) {
     await Promise.allSettled(Array.from(state.pending));
   }
+}
+
+/**
+ * Recursively walk a directory and return every file path under it.
+ */
+async function walkDir(dir) {
+  const out = [];
+  let entries;
+  try {
+    entries = await fs.readdir(dir, { withFileTypes: true });
+  } catch (err) {
+    if (err.code === 'ENOENT') return out;
+    throw err;
+  }
+  for (const e of entries) {
+    const full = path.join(dir, e.name);
+    if (e.isDirectory()) out.push(...await walkDir(full));
+    else if (e.isFile())  out.push(full);
+  }
+  return out;
+}
+
+/**
+ * Force-upload every .ts / .m3u8 file currently on disk for this stream.
+ *
+ * Why we need this: when the broadcaster disconnects, ffmpeg flushes its
+ * trailing segments and then exits. The chokidar watcher uses an 80ms
+ * "write-finish" debounce, so events for those last segments may still be
+ * pending when we close the watcher. Without an explicit sweep those final
+ * segments would never reach R2, leaving the VOD short by 5–30 seconds.
+ *
+ * Safe to call multiple times — uploadLocalFile is idempotent for segments.
+ */
+export async function sweepStreamDir(streamKey) {
+  const state = streams.get(streamKey);
+  if (!state) return;
+
+  const dir   = path.join(TMP_DIR, streamKey);
+  const files = await walkDir(dir);
+  if (!files.length) return;
+
+  console.log(`[uploader] sweep ${streamKey}: ${files.length} files on disk to verify`);
+
+  const jobs = [];
+  for (const f of files) {
+    const ext = path.extname(f).toLowerCase();
+    if (ext !== '.ts' && ext !== '.m3u8') continue;
+    if (ext === '.ts' && state.uploaded.has(f)) continue;
+    jobs.push(uploadLocalFile(streamKey, f));
+  }
+  await Promise.allSettled(jobs);
+  await flushPending(streamKey);
 }
 
 /**

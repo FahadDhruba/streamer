@@ -17,6 +17,7 @@ import {
   startWatcher,
   stopWatcher,
   flushPending,
+  sweepStreamDir,
   liveMasterUrl,
   vodMasterUrl,
   vodMp4Url,
@@ -253,6 +254,15 @@ async function finalizeStream(streamKey) {
     await flushPending(streamKey);
   } catch (err) {
     console.error(`[rtmp] flushPending error for ${streamKey}: ${err.message}`);
+  }
+
+  // CRITICAL: ffmpeg's trailing segments may still be on disk with their
+  // chokidar events not yet fired. Walk the dir explicitly and upload
+  // anything that hasn't shipped yet — otherwise the VOD comes up short.
+  try {
+    await sweepStreamDir(streamKey);
+  } catch (err) {
+    console.error(`[rtmp] sweepStreamDir error for ${streamKey}: ${err.message}`);
   }
 
   await stopWatcher(streamKey);

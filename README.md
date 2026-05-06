@@ -275,10 +275,12 @@ After VOD generation completes, `live/<streamKey>/*` is wiped from R2.
 - 4-second segments → ~4× fewer R2 PUT requests than 2-second segments.
 - Local `.ts` files are **deleted immediately** after each successful R2 upload.
 - Local disk usage per stream rarely exceeds ~30s of segments (≈30 MB).
-- Only **1080p** segments survive the post-stream cleanup (used for VOD); 720p and 480p rotate live and are wiped at the end.
-- Live segment rotation in R2 keeps at most ~8 segments per non-source quality.
+- **All segments for all renditions are kept on R2 for the full duration of the broadcast** (no live rotation). This guarantees the post-stream VOD pipeline can rebuild the full recording. After VOD generation completes, the entire `live/<streamKey>/` prefix is deleted from R2 in one sweep, so steady-state R2 storage is just the MP4 + VOD playlists.
+- A "final sweep" runs at stream end that walks the local tmp dir and uploads anything chokidar may not have shipped yet (this is what prevents truncated VODs).
 - The R2 lifecycle rule (`live/` → 1 day) is a safety net for crashed processes.
 - Server process never exits when one stream's ffmpeg crashes — the failure is contained per-stream.
+
+If you want to bring R2 storage during a live stream back down (at the cost of shorter-quality fallbacks if 1080p ever fails), you can re-introduce rotation by tracking uploaded segments in `uploader.js` and deleting older ones for non-1080p qualities — but for most use-cases full retention + post-stream cleanup is the right default.
 
 ---
 
