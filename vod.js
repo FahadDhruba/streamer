@@ -3,16 +3,22 @@
 // stream has fully exited and its remaining segments have been flushed
 // to R2.
 //
+// Source quality selection:
+//   We prefer 1080p, but if no 1080p segments exist on R2 (e.g. ffmpeg
+//   crashed early, or a future config skipped 1080p) we fall back to the
+//   next-highest rendition that has segments. Renditions are walked in
+//   the order returned by `getRenditions()` — currently 1080p → 720p → 480p.
+//
 // Pipeline:
-//   1. List every  live/<streamKey>/1080p/*.ts  on R2 (sorted by index).
-//   2. Server-side copy them to vod/<streamKey>/1080p/  so they survive
-//      any later live/ cleanup or lifecycle rules.
+//   1. Discover the highest-quality rendition with segments on R2.
+//   2. Server-side copy live/<streamKey>/<q>/*.ts → vod/<streamKey>/<q>/...
+//      so they survive any later live/ cleanup or lifecycle rules.
 //   3. Download them to a local tmp/vod/<streamKey>/concat/ dir.
 //   4. ffmpeg -f concat ... -c copy recording.mp4   (no re-encode).
 //   5. Upload recording.mp4 to vod/<streamKey>/recording.mp4.
 //   6. Generate & upload:
-//        vod/<streamKey>/1080p/index.m3u8   (HLS VOD media playlist)
-//        vod/<streamKey>/master.m3u8         (HLS master)
+//        vod/<streamKey>/<q>/index.m3u8   (HLS VOD media playlist)
+//        vod/<streamKey>/master.m3u8       (HLS master)
 //   7. Delete live/<streamKey>/* from R2 and the local tmp tree.
 
 import 'dotenv/config';
@@ -39,7 +45,12 @@ const TMP_DIR_LIVE   = path.resolve(__dirname, process.env.TMP_DIR || './tmp/liv
 const TMP_DIR_VOD    = path.resolve(__dirname, path.dirname(process.env.TMP_DIR || './tmp/live'), 'vod');
 const HLS_TARGET_S   = 4;          // matches transcoder hls_time
 
-const VOD_SOURCE_QUALITY = '1080p';
+/**
+ * Preferred VOD quality, in priority order. The first one that actually
+ * has segments on R2 is used. `getRenditions()` already returns them
+ * highest-first, but we also expose this as a constant for clarity.
+ */
+const PREFERRED_VOD_QUALITY = '1080p';
 
 /**
  * Sort segment object keys by their numeric index so concat order is correct.
@@ -51,6 +62,35 @@ function sortSegmentKeys(keys) {
     return m ? parseInt(m[1], 10) : 0;
   };
   return [...keys].sort((a, b) => num(a) - num(b));
+}
+
+/**
+ * Walk renditions highest → lowest and return the first one that has
+ * .ts segments at  live/<streamKey>/<quality>/  on R2. Returns
+ * { rendition, segmentKeys } or null if no quality has any segments.
+ */
+async function findVodSource(streamKey) {
+  // Renditions are already ordered highest→lowest in transcoder.js, but
+  // we promote PREFERRED_VOD_QUALITY to the front defensively in case that
+  // ordering ever changes.
+  const renditions = getRenditions();
+  renditions.sort((a, b) => {
+    if (a.name === PREFERRED_VOD_QUALITY) return -1;
+    if (b.name === PREFERRED_VOD_QUALITY) return  1;
+    // Otherwise prefer higher height.
+    return b.height - a.height;
+  });
+
+  for (const rendition of renditions) {
+    const prefix = `live/${streamKey}/${rendition.name}/`;
+    const allKeys = await listKeys(prefix);
+    const segmentKeys = sortSegmentKeys(allKeys.filter((k) => k.endsWith('.ts')));
+    if (segmentKeys.length > 0) {
+      return { rendition, segmentKeys };
+    }
+    console.log(`[vod] ${streamKey}: no segments at ${prefix}, trying next quality`);
+  }
+  return null;
 }
 
 /**
@@ -71,8 +111,8 @@ function runFfmpeg(args, label) {
 }
 
 /**
- * Build the VOD media playlist (#EXT-X-PLAYLIST-TYPE:VOD) for the 1080p
- * rendition. References segments by their public R2 URL.
+ * Build the VOD media playlist (#EXT-X-PLAYLIST-TYPE:VOD) for the chosen
+ * source rendition. References segments by their public R2 URL.
  */
 function buildVodMediaPlaylist(streamKey, sortedKeys) {
   // Each segment is HLS_TARGET_S long except possibly the last; we cannot
@@ -96,16 +136,16 @@ function buildVodMediaPlaylist(streamKey, sortedKeys) {
 }
 
 /**
- * Build the VOD master playlist that references the 1080p VOD media playlist.
+ * Build the VOD master playlist that references the chosen rendition's
+ * VOD media playlist.
  */
-function buildVodMasterPlaylist(streamKey) {
-  const r = getRenditions().find((x) => x.name === VOD_SOURCE_QUALITY);
+function buildVodMasterPlaylist(streamKey, rendition) {
   const codec = 'avc1.4d401f,mp4a.40.2';
   return [
     '#EXTM3U',
     '#EXT-X-VERSION:3',
-    `#EXT-X-STREAM-INF:BANDWIDTH=${r.bandwidth},RESOLUTION=${r.width}x${r.height},CODECS="${codec}",NAME="${r.name}"`,
-    publicUrlFor(`vod/${streamKey}/${VOD_SOURCE_QUALITY}/index.m3u8`),
+    `#EXT-X-STREAM-INF:BANDWIDTH=${rendition.bandwidth},RESOLUTION=${rendition.width}x${rendition.height},CODECS="${codec}",NAME="${rendition.name}"`,
+    publicUrlFor(`vod/${streamKey}/${rendition.name}/index.m3u8`),
     '',
   ].join('\n');
 }
@@ -120,18 +160,21 @@ export async function generateVod(streamKey) {
   const outDir    = path.join(TMP_DIR_VOD, streamKey);
   await ensureDir(concatDir);
 
-  // ---- 1. List live 1080p segments on R2.
-  const livePrefix = `live/${streamKey}/${VOD_SOURCE_QUALITY}/`;
-  const allKeys    = await listKeys(livePrefix);
-  const segmentKeys = sortSegmentKeys(allKeys.filter((k) => k.endsWith('.ts')));
-
-  if (segmentKeys.length === 0) {
-    console.warn(`[vod] no 1080p segments found on R2 for ${streamKey}; aborting VOD`);
+  // ---- 1. Pick the highest-quality rendition that has segments on R2.
+  const source = await findVodSource(streamKey);
+  if (!source) {
+    console.warn(`[vod] no segments found on R2 for any quality (${streamKey}); aborting VOD`);
     await deleteDir(path.join(TMP_DIR_VOD, streamKey));
     await deletePrefix(`live/${streamKey}/`);
     return null;
   }
-  console.log(`[vod] ${segmentKeys.length} 1080p segments to archive for ${streamKey}`);
+  const { rendition, segmentKeys } = source;
+  const quality = rendition.name;
+
+  if (quality !== PREFERRED_VOD_QUALITY) {
+    console.warn(`[vod] ${streamKey}: ${PREFERRED_VOD_QUALITY} unavailable, falling back to ${quality}`);
+  }
+  console.log(`[vod] ${segmentKeys.length} ${quality} segments to archive for ${streamKey}`);
 
   // ---- 2. Server-side copy live -> vod (parallel-safe via uploader's limiter).
   const copyJobs = segmentKeys.map((srcKey) => {
@@ -192,10 +235,10 @@ export async function generateVod(streamKey) {
 
   // ---- 6. Build & upload VOD playlists.
   const mediaPlaylist  = buildVodMediaPlaylist(streamKey, segmentKeys);
-  const masterPlaylist = buildVodMasterPlaylist(streamKey);
+  const masterPlaylist = buildVodMasterPlaylist(streamKey, rendition);
 
   await uploadFile({
-    key:          `vod/${streamKey}/${VOD_SOURCE_QUALITY}/index.m3u8`,
+    key:          `vod/${streamKey}/${quality}/index.m3u8`,
     body:         Buffer.from(mediaPlaylist, 'utf8'),
     contentType:  'application/vnd.apple.mpegurl',
     cacheControl: 'public, max-age=300',
